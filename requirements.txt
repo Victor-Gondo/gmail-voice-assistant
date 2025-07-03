@@ -1,0 +1,18 @@
+# Audio I/O
+pyaudio>=0.2.11
+pygame>=2.1.0
+pyttsx3>=2.90
+
+# Speech-to-Text
+openai>=0.27.0
+
+# Text-to-Speech
+elevenlabs>=0.2.0
+
+# LLM & Agent
+langchain-openai>=0.0.1
+mcp-use
+
+# Utilities
+numpy>=1.22.0
+python-dotenv>=0.21.0

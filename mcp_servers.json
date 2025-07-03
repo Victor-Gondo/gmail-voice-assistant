@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "gmail": {
+      "url": "http://gmail-mcp:3000/sse"
+    }
+  }
+}

@@ -1,0 +1,15 @@
+# Gmail MCP server container
+FROM node:18-alpine
+
+# Install the MCP server package
+RUN npm install -g @gongrzhe/server-gmail-autoauth-mcp
+
+# Create folder for OAuth keys+tokens
+RUN mkdir -p /root/.gmail-mcp
+WORKDIR /root/.gmail-mcp
+
+# Expose the default port
+EXPOSE 3000
+
+# Launch the server on container start
+CMD ["npx", "@gongrzhe/server-gmail-autoauth-mcp"]
