@@ -16,3 +16,6 @@ mcp-use
 # Utilities
 numpy>=1.22.0
 python-dotenv>=0.21.0
+
+webrtcvad
+setuptools

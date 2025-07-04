@@ -1,14 +1,3 @@
-"""
-Voice-First AI Personal Assistant with MCP Integration (Improved Version)
-
-This example demonstrates a voice-enabled personal assistant that uses:
-- Speech-to-text for voice input (OpenAI Whisper)
-- MCPAgent with multiple MCP servers (Linear, filesystem)
-- Text-to-speech for voice output (ElevenLabs speak or system TTS)
-
-This version includes better error handling and fallback options.
-"""
-
 import asyncio
 import io
 import json
@@ -16,30 +5,32 @@ import os
 import sys
 import tempfile
 import wave
-import logging
+
 import numpy as np
 import openai
 import pyaudio
 import pygame
 import pyttsx3
+import webrtcvad  # Added for accurate voice activity detection
 from elevenlabs import play
 from elevenlabs.client import ElevenLabs
 from elevenlabs.types.voice_settings import VoiceSettings
 from langchain_openai import ChatOpenAI
 from mcp_use import MCPAgent, MCPClient
 
-TTS_ENGINE = pyttsx3.init()
-
-# Configure root logger at module import
+# Logging setup (added previously)
+import logging
 logging.basicConfig(
-    level=logging.INFO, 
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger(__name__)
 
+TTS_ENGINE = pyttsx3.init()
+
 class VoiceAssistant:
-    """Improved voice-enabled AI assistant with better error handling."""
+    """Voice assistant with wake-word gating and VAD-based silence detection."""
 
     def __init__(
         self,
@@ -47,62 +38,55 @@ class VoiceAssistant:
         elevenlabs_api_key: str | None = None,
         model: str = "o4-mini",
         elevenlabs_voice_id: str = "ZF6FPAbjXT4488VcRRnw",
+        vad_aggressiveness: int = 2,
         silence_threshold: int = 500,
         silence_duration: float = 1.5,
         mcp_config: dict | None = None,
         notes_dir: str | None = None,
         system_prompt: str | None = None,
     ):
-        """Initialize the voice assistant.
-
-        Args:
-            openai_api_key: OpenAI API key for Whisper and GPT models
-            elevenlabs_api_key: Optional ElevenLabs API key for TTS
-            model: OpenAI model to use (default: gpt-4)
-            elevenlabs_voice_id: ElevenLabs voice ID (default: Rachel)
-            silence_threshold: Audio silence detection threshold
-            silence_duration: How long to wait after speech stops
-            mcp_config: Optional MCP server configuration dict
-            notes_dir: Directory for storing notes (default: temp dir)
-            system_prompt: Optional custom system prompt for the assistant
-        """
-        # Audio configuration
+        # Audio parameters
         self.audio_format = pyaudio.paInt16
         self.channels = 1
         self.rate = 16000
-        self.chunk = 1024
+        self.chunk = int(self.rate * 30 / 1000)  # 30ms per frame
         self.silence_threshold = silence_threshold
         self.silence_duration = silence_duration
 
-        # Initialize audio components
+        # Wake word
+        self.wake_word = "email assistant"
+
+        # VAD selection
+        if webrtcvad:
+            self.vad = webrtcvad.Vad(vad_aggressiveness)
+            self.use_webrtcvad = True
+            logger.info("Using webrtcvad for voice activity detection")
+        else:
+            self.vad = None
+            self.use_webrtcvad = False
+            logger.info("Using amplitude threshold for silence detection")
+
+        # Initialize audio I/O
         self.audio = pyaudio.PyAudio()
         pygame.mixer.init()
 
-        # OpenAI client for speech-to-text
+        # OpenAI client (Whisper & GPT)
         self.openai_client = openai.OpenAI(api_key=openai_api_key)
         self.model = model
 
-        # ElevenLabs client for text-to-speech
-        self.elevenlabs_client = None
+        # ElevenLabs TTS
+        self.elevenlabs_client = ElevenLabs(api_key=elevenlabs_api_key) if elevenlabs_api_key else None
         self.elevenlabs_voice_id = elevenlabs_voice_id
-        if elevenlabs_api_key:
-            self.elevenlabs_client = ElevenLabs(api_key=elevenlabs_api_key)
 
-        # MCP configuration
+        # MCP agent config
         self.mcp_config = mcp_config
-        self.mcp_client = None
         self.agent = None
         self.system_prompt = system_prompt or (
-            "You are a helpful voice assistant with access to various tools. Your name is mcp-use."
-            "Be concise in your responses since they will be spoken aloud. Summarize your results."
-            "Behave like a great motivational speaker, and motivate me throughout the conversation."
+            "You are a helpful voice assistant with access to various tools. Be concise in your responses."
         )
 
-        # Create a proper notes directory
-        if notes_dir:
-            self.notes_dir = notes_dir
-        else:
-            self.notes_dir = os.path.join(tempfile.gettempdir(), "voice_assistant_notes")
+        # Notes directory
+        self.notes_dir = notes_dir or os.path.join(tempfile.gettempdir(), "voice_assistant_notes")
         os.makedirs(self.notes_dir, exist_ok=True)
 
     def _substitute_env_vars(self, config: dict) -> dict:
@@ -161,15 +145,13 @@ class VoiceAssistant:
             return False
 
     def detect_silence(self, audio_data: bytes) -> bool:
-        """Detect if audio contains silence."""
+        """Fallback amplitude-based silence detection."""
         audio_array = np.frombuffer(audio_data, dtype=np.int16)
         return np.max(np.abs(audio_array)) < self.silence_threshold
 
     def record_audio(self) -> bytes | None:
-        """Record audio from microphone."""
-        logger.info("Listening for speech…")
-
-
+        """Record audio until end-of-speech using VAD or amplitude threshold."""
+        logger.info("Listening for speech...")
         try:
             stream = self.audio.open(
                 format=self.audio_format,
@@ -178,187 +160,169 @@ class VoiceAssistant:
                 input=True,
                 frames_per_buffer=self.chunk,
             )
-
             frames = []
-            silence_frames = 0
-            silence_frame_threshold = int(self.rate / self.chunk * self.silence_duration)
             has_speech = False
+            silence_count = 0
+
+            # Determine silence cutoff
+            if self.use_webrtcvad:
+                max_silence_frames = int(self.silence_duration * 1000 / 30)
+            else:
+                max_silence_frames = int(self.rate / self.chunk * self.silence_duration)
 
             while True:
                 data = stream.read(self.chunk, exception_on_overflow=False)
                 frames.append(data)
-
-                if self.detect_silence(data):
-                    silence_frames += 1
-                    if has_speech and silence_frames > silence_frame_threshold:
-                        break
+                if self.use_webrtcvad:
+                    speech = self.vad.is_speech(data, sample_rate=self.rate)
                 else:
-                    silence_frames = 0
-                    has_speech = True
+                    speech = not self.detect_silence(data)
 
-                if len(frames) > self.rate / self.chunk * 30:
+                if speech:
+                    has_speech = True
+                    silence_count = 0
+                else:
+                    if has_speech:
+                        silence_count += 1
+                        if silence_count > max_silence_frames:
+                            break
+
+                # Safety cap: max 30 seconds
+                if len(frames) > int(self.rate / self.chunk * 30):
                     break
 
             stream.stop_stream()
             stream.close()
 
             if not has_speech:
-                logger.warning("No speech detected")
+                logger.warning("No speech detected.")
                 return None
 
-            logger.debug("Audio captured, sending to Whisper…")
+            logger.debug("Audio captured, proceeding to transcription.")
             return b"".join(frames)
-
         except Exception as e:
-            print(f"Error recording audio: {e}")
+            logger.error("Error recording audio", exc_info=e)
             return None
 
+    async def wait_for_wake(self) -> None:
+        """Listen continuously until wake word is heard."""
+        logger.info(f"Waiting for wake word: '{self.wake_word}'")
+        while True:
+            audio = self.record_audio()
+            if not audio:
+                continue
+            text = self.audio_to_text(audio)
+            if not text:
+                continue
+            logger.info(f"Heard: {text}")
+            if self.wake_word in text.lower():
+                logger.info("Wake word detected!")
+                return
+            logger.debug("Wake word not found, retrying...")
+
     def audio_to_text(self, audio_data: bytes) -> str | None:
-        """Convert audio to text using OpenAI Whisper."""
+        """Convert audio bytes to text via Whisper."""
         try:
-            # Create WAV file in memory
             wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, "wb") as wf:
+            with wave.open(wav_buffer, 'wb') as wf:
                 wf.setnchannels(self.channels)
                 wf.setsampwidth(self.audio.get_sample_size(self.audio_format))
                 wf.setframerate(self.rate)
                 wf.writeframes(audio_data)
-
             wav_buffer.seek(0)
-            wav_buffer.name = "audio.wav"
-
-            # Transcribe using Whisper
-            response = self.openai_client.audio.transcriptions.create(model="gpt-4o-mini-transcribe", file=wav_buffer, language="en")
-
-            return response.text.strip()
-
+            wav_buffer.name = 'audio.wav'
+            resp = self.openai_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=wav_buffer,
+                language="en"
+            )
+            return resp.text.strip()
         except Exception as e:
             logger.error("Error transcribing audio", exc_info=e)
             return None
 
     async def text_to_speech(self, text: str) -> bool:
-        """Convert text to speech using available methods."""
-        # Try ElevenLabs first
+        """Speak text via ElevenLabs or fallback TTS_ENGINE."""
         if self.elevenlabs_client:
             try:
-                # Generate audio using ElevenLabs
                 audio = self.elevenlabs_client.text_to_speech.convert(
                     text=text,
                     voice_id=self.elevenlabs_voice_id,
-                    model_id="eleven_multilingual_v2",  # Best for high-quality output and multilingual
-                    output_format="mp3_44100_128",  # Balanced quality + size
-                    optimize_streaming_latency="2",  # Optional: best for real-time feel without delay
+                    model_id="eleven_multilingual_v2",
+                    output_format="mp3_44100_128",
+                    optimize_streaming_latency="2",
                     voice_settings=VoiceSettings(speed=1.1),
                 )
-
-                # Play the audio
                 play(audio)
                 return True
-            except Exception as e:
-                logger.error("ElevenLabs TTS failed:", exc_info=e)
-
-        # Final fallback: just print
-        return False
+            except Exception:
+                logger.warning("ElevenLabs TTS failed, using fallback.")
+        TTS_ENGINE.say(text)
+        TTS_ENGINE.runAndWait()
+        return True
 
     async def process_command(self, text: str) -> str:
-        """Process user command with MCP agent."""
-        print(f"\nYou said: {text}")
-
-        # Special commands
+        """Handle built-in commands or forward to MCP agent."""
+        logger.info(f"User said: {text}")
         if text.lower() in ["exit", "quit", "goodbye"]:
-            return "Goodbye! Have a great day!"
-
+            return "Goodbye!"
         if text.lower() == "clear":
             if self.agent:
                 self.agent.clear_conversation_history()
-            return "Conversation history cleared."
-
-        # Process with MCP agent
+            return "History cleared."
         if not self.agent:
-            return "Sorry, the assistant is not properly initialized."
-
+            return "Assistant not initialized."
         try:
-            response = await self.agent.run(text)
-            return response
+            return await self.agent.run(text)
         except Exception as e:
-            return f"Sorry, I encountered an error: {str(e)}"
+            logger.error("Error in MCP agent", exc_info=e)
+            return "Error processing command."
 
-    async def run(self):
-        """Main loop for the voice assistant."""
-        print("\n===== Voice-First AI Assistant (Improved) =====")
-        print("\nCommands: 'help', 'clear', 'exit'")
-        print("===============================================\n")
-
-        # Initialize MCP
+    async def run(self) -> None:
+        """Main loop: wake-word → record → transcribe → respond → speak."""
+        logger.info("Starting assistant...")
         if not await self.initialize_mcp():
-            print("Failed to initialize MCP. Exiting.")
+            logger.error("MCP init failed, exiting.")
             return
-
         try:
             while True:
-                # Record audio or get text input
-                audio_data = self.record_audio()
-                if not audio_data:
+                await self.wait_for_wake()
+                logger.info("Ready for command.")
+                audio = self.record_audio()
+                if not audio:
                     continue
-
-                # Convert to text
-                text = self.audio_to_text(audio_data)
+                text = self.audio_to_text(audio)
                 if not text:
                     continue
-
-                # Process command
                 response = await self.process_command(text)
-                print(f"\nAssistant: {response}")
-
-                # Check for exit
+                logger.info(f"Assistant: {response}")
+                await self.text_to_speech(response)
                 if text.lower() in ["exit", "quit", "goodbye"]:
                     break
-
-                # Try to speak the response
-                await self.text_to_speech(response)
-
         except KeyboardInterrupt:
-            logger.info("Interrupted by user (KeyboardInterrupt)")
+            logger.info("Interrupted by user.")
         finally:
-            # Cleanup
             self.audio.terminate()
             pygame.mixer.quit()
-            if self.mcp_client and self.mcp_client.sessions:
+            if hasattr(self, 'mcp_client') and self.mcp_client:
                 await self.mcp_client.close_all_sessions()
 
 
 async def main():
-    """Run the improved voice assistant."""
-    # Example usage - in production, load these from environment or config
+    """CLI entrypoint: parse args and launch assistant."""
     import argparse
-
     from dotenv import load_dotenv
-
-    # Load environment variables if .env exists
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="Voice-enabled AI assistant")
     parser.add_argument("--openai-api-key", default=os.getenv("OPENAI_API_KEY"), help="OpenAI API key")
     parser.add_argument("--elevenlabs-api-key", default=os.getenv("ELEVENLABS_API_KEY"), help="ElevenLabs API key")
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-4"), help="OpenAI model to use")
-    parser.add_argument(
-        "--voice-id", default=os.getenv("ELEVENLABS_VOICE_ID", "ZF6FPAbjXT4488VcRRnw"), help="ElevenLabs voice ID"
-    )
-    parser.add_argument(
-        "--silence-threshold",
-        type=int,
-        default=int(os.getenv("VOICE_SILENCE_THRESHOLD", "500")),
-        help="Silence detection threshold",
-    )
-    parser.add_argument(
-        "--silence-duration",
-        type=float,
-        default=float(os.getenv("VOICE_SILENCE_DURATION", "1.5")),
-        help="Silence duration",
-    )
-    parser.add_argument(
-        "--system-prompt", default=os.getenv("ASSISTANT_SYSTEM_PROMPT"), help="Custom system prompt for the assistant"
-    )
+    parser.add_argument("--voice-id", default=os.getenv("ELEVENLABS_VOICE_ID", "ZF6FPAbjXT4488VcRRnw"), help="ElevenLabs voice ID")
+    parser.add_argument("--vad-aggressiveness", type=int, default=2, help="webrtcvad aggressiveness (0-3)")
+    parser.add_argument("--silence-threshold", type=int, default=int(os.getenv("VOICE_SILENCE_THRESHOLD", "500")), help="Amplitude threshold for silence")
+    parser.add_argument("--silence-duration", type=float, default=float(os.getenv("VOICE_SILENCE_DURATION", "1.5")), help="Silence duration in seconds")
+    parser.add_argument("--system-prompt", default=os.getenv("ASSISTANT_SYSTEM_PROMPT"), help="Custom system prompt")
 
     args = parser.parse_args()
 
@@ -367,6 +331,7 @@ async def main():
         logger.error("Set OPENAI_API_KEY environment variable or pass --openai-api-key")
         sys.exit(1)
 
+    # Load MCP servers config
     with open("mcp_servers.json", "r") as f:
         mcp_config = json.load(f)
 
@@ -375,6 +340,7 @@ async def main():
         elevenlabs_api_key=args.elevenlabs_api_key,
         model=args.model,
         elevenlabs_voice_id=args.voice_id,
+        vad_aggressiveness=args.vad_aggressiveness,
         silence_threshold=args.silence_threshold,
         silence_duration=args.silence_duration,
         system_prompt=args.system_prompt,
