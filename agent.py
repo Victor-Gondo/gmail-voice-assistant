@@ -16,7 +16,7 @@ import os
 import sys
 import tempfile
 import wave
-
+import logging
 import numpy as np
 import openai
 import pyaudio
@@ -30,6 +30,13 @@ from mcp_use import MCPAgent, MCPClient
 
 TTS_ENGINE = pyttsx3.init()
 
+# Configure root logger at module import
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
 
 class VoiceAssistant:
     """Improved voice-enabled AI assistant with better error handling."""
@@ -123,7 +130,7 @@ class VoiceAssistant:
             # Try to load from mcp_servers.json
             config_file = os.path.join(os.path.dirname(__file__), "mcp_servers.json")
             if os.path.exists(config_file):
-                print("os file exist")
+                logger.debug("Found mcp_servers.json file")
                 with open(config_file) as f:
                     config = json.load(f)
                 # Replace environment variable placeholders
@@ -146,11 +153,11 @@ class VoiceAssistant:
             )
             await self.agent.initialize()
 
-            print("✓ MCP servers initialized successfully!")
+            logger.info("MCP servers initialized successfully")
             return True
 
         except Exception as e:
-            print(f"✗ Error initializing MCP: {e}")
+            logger.error("Error initializing MCP", exc_info=e)
             return False
 
     def detect_silence(self, audio_data: bytes) -> bool:
@@ -160,7 +167,8 @@ class VoiceAssistant:
 
     def record_audio(self) -> bytes | None:
         """Record audio from microphone."""
-        print("\nListening... (speak now)")
+        logger.info("Listening for speech…")
+
 
         try:
             stream = self.audio.open(
@@ -195,10 +203,10 @@ class VoiceAssistant:
             stream.close()
 
             if not has_speech:
-                print("No speech detected.")
+                logger.warning("No speech detected")
                 return None
 
-            print("Processing...")
+            logger.debug("Audio captured, sending to Whisper…")
             return b"".join(frames)
 
         except Exception as e:
@@ -225,7 +233,7 @@ class VoiceAssistant:
             return response.text.strip()
 
         except Exception as e:
-            print(f"Error transcribing audio: {e}")
+            logger.error("Error transcribing audio", exc_info=e)
             return None
 
     async def text_to_speech(self, text: str) -> bool:
@@ -247,7 +255,7 @@ class VoiceAssistant:
                 play(audio)
                 return True
             except Exception as e:
-                print(f"ElevenLabs TTS failed: {e}")
+                logger.error("ElevenLabs TTS failed:", exc_info=e)
 
         # Final fallback: just print
         return False
@@ -310,7 +318,7 @@ class VoiceAssistant:
                 await self.text_to_speech(response)
 
         except KeyboardInterrupt:
-            print("\n\nInterrupted by user.")
+            logger.info("Interrupted by user (KeyboardInterrupt)")
         finally:
             # Cleanup
             self.audio.terminate()
@@ -355,9 +363,12 @@ async def main():
     args = parser.parse_args()
 
     if not args.openai_api_key:
-        print("Error: OpenAI API key is required")
-        print("Set OPENAI_API_KEY environment variable or use --openai-api-key")
+        logger.error("OpenAI API key is required")
+        logger.error("Set OPENAI_API_KEY environment variable or pass --openai-api-key")
         sys.exit(1)
+
+    with open("mcp_servers.json", "r") as f:
+        mcp_config = json.load(f)
 
     assistant = VoiceAssistant(
         openai_api_key=args.openai_api_key,
@@ -367,6 +378,7 @@ async def main():
         silence_threshold=args.silence_threshold,
         silence_duration=args.silence_duration,
         system_prompt=args.system_prompt,
+        mcp_config=mcp_config,
     )
     await assistant.run()
 

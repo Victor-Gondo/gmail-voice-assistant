@@ -1,7 +1,8 @@
 {
   "mcpServers": {
     "gmail": {
-      "url": "http://gmail-mcp:3000/sse"
+      "command": "npx.cmd",
+      "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"]
     }
   }
 }
