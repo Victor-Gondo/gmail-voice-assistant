@@ -54,7 +54,7 @@ class VoiceAssistant:
         self.silence_duration = silence_duration
 
         # Wake word
-        self.wake_word = "email assistant"
+        self.wake_word = "assistant"
 
         # VAD selection
         if webrtcvad:
@@ -150,7 +150,7 @@ class VoiceAssistant:
         return np.max(np.abs(audio_array)) < self.silence_threshold
 
     def record_audio(self) -> bytes | None:
-        """Record audio until end-of-speech using VAD or amplitude threshold."""
+        """Record audio. Skip leading silence, then record until end-of-speech."""
         logger.info("Listening for speech...")
         try:
             stream = self.audio.open(
@@ -161,10 +161,10 @@ class VoiceAssistant:
                 frames_per_buffer=self.chunk,
             )
             frames = []
-            has_speech = False
+            recording = False
             silence_count = 0
 
-            # Determine silence cutoff
+            # Determine number of silence frames
             if self.use_webrtcvad:
                 max_silence_frames = int(self.silence_duration * 1000 / 30)
             else:
@@ -172,33 +172,44 @@ class VoiceAssistant:
 
             while True:
                 data = stream.read(self.chunk, exception_on_overflow=False)
-                frames.append(data)
+                # Determine if current chunk has speech
                 if self.use_webrtcvad:
-                    speech = self.vad.is_speech(data, sample_rate=self.rate)
+                    is_speech = self.vad.is_speech(data, sample_rate=self.rate)
                 else:
-                    speech = not self.detect_silence(data)
+                    is_speech = not self.detect_silence(data)
 
-                if speech:
-                    has_speech = True
-                    silence_count = 0
+                if not recording:
+                    # Wait for initial speech
+                    if is_speech:
+                        recording = True
+                        frames.append(data)
+                        logger.debug("Speech detected, starting recording")
+                    else:
+                        # Skip leading silence
+                        continue
                 else:
-                    if has_speech:
+                    frames.append(data)
+                    if is_speech:
+                        silence_count = 0
+                    else:
                         silence_count += 1
                         if silence_count > max_silence_frames:
+                            logger.debug("End of speech detected, stopping recording")
                             break
 
                 # Safety cap: max 30 seconds
                 if len(frames) > int(self.rate / self.chunk * 30):
+                    logger.debug("Max recording duration reached, stopping")
                     break
 
             stream.stop_stream()
             stream.close()
 
-            if not has_speech:
-                logger.warning("No speech detected.")
+            if not frames:
+                logger.warning("No speech captured.")
                 return None
 
-            logger.debug("Audio captured, proceeding to transcription.")
+            logger.debug("Audio captured: %d frames", len(frames))
             return b"".join(frames)
         except Exception as e:
             logger.error("Error recording audio", exc_info=e)

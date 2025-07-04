@@ -1,6 +1,7 @@
 pip install -r requirements.txt
 
-run this in terminal and authorize:
+run this in terminal to install and authorize:
+npx -y @smithery/cli install @gongrzhe/server-gmail-autoauth-mcp
 npx @gongrzhe/server-gmail-autoauth-mcp auth
 
 run agent.py.
