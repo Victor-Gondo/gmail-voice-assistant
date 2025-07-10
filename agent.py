@@ -5,6 +5,8 @@ import os
 import sys
 import tempfile
 import wave
+import re
+import threading
 
 import numpy as np
 import openai
@@ -17,8 +19,66 @@ from elevenlabs.client import ElevenLabs
 from elevenlabs.types.voice_settings import VoiceSettings
 from langchain_openai import ChatOpenAI
 from mcp_use import MCPAgent, MCPClient
+import sounddevice as sd
 
-# Logging setup (added previously)
+# Ensure sounddevice is initialized with native audio API
+def select_native_audio():
+    """
+    Choose the host API index for ALSA (Linux) and log native APIs on Windows/macOS.
+    """
+    apis = sd.query_hostapis()
+    target = None
+
+    for idx, api in enumerate(apis):
+        name = api.get("name", "").lower()
+
+        if sys.platform.startswith("linux") and "alsa" in name:
+            target = idx
+            sd.default.hostapi = idx
+            print(f"🖥️ Using ALSA (API {idx}: {api['name']})")
+            return
+
+        if sys.platform == "win32" and "wasapi" in name:
+            target = idx
+            print(f"🖥️ Detected WASAPI (API {idx}: {api['name']}) – no assignment needed")
+            return
+
+        if sys.platform == "darwin" and "core audio" in name:
+            target = idx
+            print(f"🖥️ Detected Core Audio (API {idx}: {api['name']}) – no assignment needed")
+            return
+
+    # Fallback
+    default_api = apis[sd.default.hostapi]["name"]
+    print(f"⚠️ Native audio API not found; using default ({sd.default.hostapi}: {default_api})")
+
+# Call right away
+select_native_audio()
+
+def credential_path(rel_path: str) -> str:
+    """
+    Return the absolute path to rel_path, preferring:
+     1) An external file next to the EXE (when frozen) or script.
+     2) A bundled file inside _MEIPASS (if you ever embed defaults).
+    """
+    if getattr(sys, "frozen", False):
+        # Running as frozen exe
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        # Running as script
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    external = os.path.join(base_dir, rel_path)
+    if os.path.exists(external):
+        return external
+    # Fallback into bundle (if embedded)
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    if bundle_dir:
+        bundled = os.path.join(bundle_dir, rel_path)
+        if os.path.exists(bundled):
+            return bundled
+    raise FileNotFoundError(f"Cannot find {rel_path} in {base_dir}")
+
+
 import logging
 logging.basicConfig(
     level=logging.INFO,
@@ -52,7 +112,8 @@ class VoiceAssistant:
         self.chunk = int(self.rate * 30 / 1000)  # 30ms per frame
         self.silence_threshold = silence_threshold
         self.silence_duration = silence_duration
-
+        # flag to let “stop” commands interrupt speaking (see process_command)
+        self._stop_speaking = threading.Event()
         # Wake word
         self.wake_word = "assistant"
 
@@ -83,11 +144,10 @@ class VoiceAssistant:
         self.agent = None
         self.system_prompt = system_prompt or (
             "You are a helpful voice assistant with access to various tools. Be concise in your responses."
+        
         )
-
-        # Notes directory
-        self.notes_dir = notes_dir or os.path.join(tempfile.gettempdir(), "voice_assistant_notes")
-        os.makedirs(self.notes_dir, exist_ok=True)
+        
+        
 
     def _substitute_env_vars(self, config: dict) -> dict:
         """Recursively substitute environment variable placeholders in config."""
@@ -111,14 +171,13 @@ class VoiceAssistant:
         if self.mcp_config:
             config = self.mcp_config
         else:
-            # Try to load from mcp_servers.json
-            config_file = os.path.join(os.path.dirname(__file__), "mcp_servers.json")
-            if os.path.exists(config_file):
-                logger.debug("Found mcp_servers.json file")
-                with open(config_file) as f:
-                    config = json.load(f)
-                # Replace environment variable placeholders
-                config = self._substitute_env_vars(config)
+            # New: look for mcp_servers.json next to the EXE/script
+            config_path = credential_path("mcp_servers.json")
+            logger.debug(f"Loading MCP config from {config_path}")
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            # Replace environment variable placeholders
+            config = self._substitute_env_vars(config)
 
         try:
             # Create MCP client
@@ -275,18 +334,35 @@ class VoiceAssistant:
     async def process_command(self, text: str) -> str:
         """Handle built-in commands or forward to MCP agent."""
         logger.info(f"User said: {text}")
-        if text.lower() in ["exit", "quit", "goodbye"]:
+        # normalize once: strip punctuation + lowercase
+        normalized = re.sub(r"[^\w\s]", "", text).strip().lower()
+
+        # built-in exit
+        if normalized in {"exit", "quit", "goodbye"}:
             return "Goodbye!"
-        if text.lower() == "clear":
+
+        # clear history
+        if normalized == "clear":
             if self.agent:
                 self.agent.clear_conversation_history()
             return "History cleared."
+
+        # stub for stopping mid-speech (needs wiring in text_to_speech)
+        if normalized == "stop":
+            self._stop_speaking.set()
+            return ""                      # no spoken response
+
         if not self.agent:
             return "Assistant not initialized."
+
         try:
-            return await self.agent.run(text)
-        except Exception as e:
-            logger.error("Error in MCP agent", exc_info=e)
+            result = await self.agent.run(text)
+            # never return None
+            if not isinstance(result, str) or not result:
+                return "Sorry, I didn't catch that."
+            return result
+        except Exception:
+            logger.exception("Error in MCP agent")
             return "Error processing command."
 
     async def run(self) -> None:
@@ -305,13 +381,19 @@ class VoiceAssistant:
                 text = self.audio_to_text(audio)
                 if not text:
                     continue
+                # run command registry or forward to MCP
                 response = await self.process_command(text)
-                logger.info(f"Assistant: {response}")
-                await self.text_to_speech(response)
-                if text.lower() in ["exit", "quit", "goodbye"]:
+                logger.info(f"Assistant: {response!r}")
+
+                # only speak if there's something to say
+                if response:
+                    await self.text_to_speech(response)
+
+                # exit once we returned “Goodbye!”
+                if response.strip().lower().startswith("goodbye"):
                     break
-        except KeyboardInterrupt:
             logger.info("Interrupted by user.")
+            
         finally:
             self.audio.terminate()
             pygame.mixer.quit()
@@ -343,9 +425,9 @@ async def main():
         sys.exit(1)
 
     # Load MCP servers config
-    with open("mcp_servers.json", "r") as f:
+    with open(credential_path("mcp_servers.json"), "r") as f:
         mcp_config = json.load(f)
-
+    
     assistant = VoiceAssistant(
         openai_api_key=args.openai_api_key,
         elevenlabs_api_key=args.elevenlabs_api_key,
