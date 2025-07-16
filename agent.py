@@ -3,7 +3,6 @@ import io
 import json
 import os
 import sys
-import tempfile
 import wave
 import re
 import threading
@@ -80,6 +79,7 @@ def credential_path(rel_path: str) -> str:
 
 
 import logging
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -274,22 +274,6 @@ class VoiceAssistant:
             logger.error("Error recording audio", exc_info=e)
             return None
 
-    async def wait_for_wake(self) -> None:
-        """Listen continuously until wake word is heard."""
-        logger.info(f"Waiting for wake word: '{self.wake_word}'")
-        while True:
-            audio = self.record_audio()
-            if not audio:
-                continue
-            text = self.audio_to_text(audio)
-            if not text:
-                continue
-            logger.info(f"Heard: {text}")
-            if self.wake_word in text.lower():
-                logger.info("Wake word detected!")
-                return
-            logger.debug("Wake word not found, retrying...")
-
     def audio_to_text(self, audio_data: bytes) -> str | None:
         """Convert audio bytes to text via Whisper."""
         try:
@@ -312,25 +296,34 @@ class VoiceAssistant:
             return None
 
     async def text_to_speech(self, text: str) -> bool:
-        """Speak text via ElevenLabs or fallback TTS_ENGINE."""
-        if self.elevenlabs_client:
-            try:
-                audio = self.elevenlabs_client.text_to_speech.convert(
-                    text=text,
-                    voice_id=self.elevenlabs_voice_id,
-                    model_id="eleven_multilingual_v2",
-                    output_format="mp3_44100_128",
-                    optimize_streaming_latency="2",
-                    voice_settings=VoiceSettings(speed=1.1),
-                )
-                play(audio)
-                return True
-            except Exception:
-                logger.warning("ElevenLabs TTS failed, using fallback.")
-        TTS_ENGINE.say(text)
-        TTS_ENGINE.runAndWait()
-        return True
+        """Speak text via OpenAI TTS (tts-1, alloy voice), falling back to pyttsx3 if that fails."""
+        try:
+            # Call OpenAI TTS endpoint synchronously
+            resp = self.openai_client.audio.speech.create(
+                model="tts-1",
+                voice="shimmer",
+                input=text
+            )
+            # Extract raw MP3 bytes
+            audio_bytes = resp.content
 
+            # Play via pygame
+            buf = io.BytesIO(audio_bytes)
+            buf.name = "speech.mp3"
+            buf.seek(0)
+            pygame.mixer.music.load(buf)
+            pygame.mixer.music.play()
+            # Wait until playback finishes
+            while pygame.mixer.music.get_busy():
+                await asyncio.sleep(0.1)
+            return True
+
+        except Exception as e:
+            logger.warning(f"OpenAI TTS failed ({e}), falling back to pyttsx3.")
+            TTS_ENGINE.say(text)
+            TTS_ENGINE.runAndWait()
+            return True
+        
     async def process_command(self, text: str) -> str:
         """Handle built-in commands or forward to MCP agent."""
         logger.info(f"User said: {text}")
@@ -366,40 +359,53 @@ class VoiceAssistant:
             return "Error processing command."
 
     async def run(self) -> None:
-        """Main loop: wake-word → record → transcribe → respond → speak."""
+        """Main loop: record until silence, detect wake word in transcript, then process command."""
         logger.info("Starting assistant...")
+        # Initialize MCP
         if not await self.initialize_mcp():
             logger.error("MCP init failed, exiting.")
             return
         try:
             while True:
-                await self.wait_for_wake()
-                logger.info("Ready for command.")
+                # 1) Record audio (wake word + command)
                 audio = self.record_audio()
                 if not audio:
                     continue
+
+                # 2) Transcribe entire chunk
                 text = self.audio_to_text(audio)
                 if not text:
                     continue
-                # run command registry or forward to MCP
-                response = await self.process_command(text)
-                logger.info(f"Assistant: {response!r}")
+                logger.info(f"Heard: {text}")
 
-                # only speak if there's something to say
+                # 3) Check for wake word
+                lower = text.lower()
+                if self.wake_word not in lower:
+                    logger.debug("Wake word not detected, continuing...")
+                    continue
+
+                # 4) Extract command after wake word
+                cmd = lower.split(self.wake_word, 1)[1].strip()
+                if not cmd:
+                    logger.debug("No command after wake word, continuing...")
+                    continue
+                logger.info(f"Command detected: {cmd}")
+
+                # 5) Process and speak
+                response = await self.process_command(cmd)
+                logger.info(f"Assistant: {response!r}")
                 if response:
                     await self.text_to_speech(response)
 
-                # exit once we returned “Goodbye!”
+                # 6) Exit on 'goodbye'
                 if response.strip().lower().startswith("goodbye"):
                     break
-            logger.info("Interrupted by user.")
-            
         finally:
+            # Cleanup
             self.audio.terminate()
             pygame.mixer.quit()
             if hasattr(self, 'mcp_client') and self.mcp_client:
                 await self.mcp_client.close_all_sessions()
-
 
 async def main():
     """CLI entrypoint: parse args and launch assistant."""
