@@ -1,24 +1,23 @@
 import asyncio
 import io
 import json
+import logging
 import os
-import sys
-import wave
 import re
+import sys
 import threading
+import wave
 
 import numpy as np
 import openai
 import pyaudio
 import pygame
 import pyttsx3
+import sounddevice as sd
 import webrtcvad  # Added for accurate voice activity detection
-from elevenlabs import play
-from elevenlabs.client import ElevenLabs
-from elevenlabs.types.voice_settings import VoiceSettings
 from langchain_openai import ChatOpenAI
 from mcp_use import MCPAgent, MCPClient
-import sounddevice as sd
+
 
 # Ensure sounddevice is initialized with native audio API
 def select_native_audio():
@@ -33,26 +32,33 @@ def select_native_audio():
 
         if sys.platform.startswith("linux") and "alsa" in name:
             target = idx
-            sd.default.hostapi = idx
             print(f"🖥️ Using ALSA (API {idx}: {api['name']})")
             return
 
         if sys.platform == "win32" and "wasapi" in name:
             target = idx
-            print(f"🖥️ Detected WASAPI (API {idx}: {api['name']}) – no assignment needed")
+            print(
+                f"🖥️ Detected WASAPI (API {idx}: {api['name']}) – no assignment needed"
+            )
             return
 
         if sys.platform == "darwin" and "core audio" in name:
             target = idx
-            print(f"🖥️ Detected Core Audio (API {idx}: {api['name']}) – no assignment needed")
+            print(
+                f"🖥️ Detected Core Audio (API {idx}: {api['name']}) – no assignment needed"
+            )
             return
 
     # Fallback
     default_api = apis[sd.default.hostapi]["name"]
-    print(f"⚠️ Native audio API not found; using default ({sd.default.hostapi}: {default_api})")
+    print(
+        f"⚠️ Native audio API not found; using default ({sd.default.hostapi}: {default_api})"
+    )
+
 
 # Call right away
 select_native_audio()
+
 
 def credential_path(rel_path: str) -> str:
     """
@@ -78,16 +84,15 @@ def credential_path(rel_path: str) -> str:
     raise FileNotFoundError(f"Cannot find {rel_path} in {base_dir}")
 
 
-import logging
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
 TTS_ENGINE = pyttsx3.init()
+
 
 class VoiceAssistant:
     """Voice assistant with wake-word gating and VAD-based silence detection."""
@@ -95,12 +100,10 @@ class VoiceAssistant:
     def __init__(
         self,
         openai_api_key: str,
-        elevenlabs_api_key: str | None = None,
         model: str = "o4-mini",
-        elevenlabs_voice_id: str = "ZF6FPAbjXT4488VcRRnw",
         vad_aggressiveness: int = 2,
         silence_threshold: int = 500,
-        silence_duration: float = 1.5,
+        silence_duration: float = 0.5,
         mcp_config: dict | None = None,
         notes_dir: str | None = None,
         system_prompt: str | None = None,
@@ -135,19 +138,12 @@ class VoiceAssistant:
         self.openai_client = openai.OpenAI(api_key=openai_api_key)
         self.model = model
 
-        # ElevenLabs TTS
-        self.elevenlabs_client = ElevenLabs(api_key=elevenlabs_api_key) if elevenlabs_api_key else None
-        self.elevenlabs_voice_id = elevenlabs_voice_id
-
         # MCP agent config
         self.mcp_config = mcp_config
         self.agent = None
         self.system_prompt = system_prompt or (
-            "You are a helpful voice assistant with access to various tools. Be concise in your responses."
-        
+            "You are a helpful voice assistant that helps user to manage their gmail. Be concise in your responses. Do not add unrelevant information. If you are asked to read an email, fetch 10 latest emails, read the subject and the short summary of the body of the email, then mark it as read."
         )
-        
-        
 
     def _substitute_env_vars(self, config: dict) -> dict:
         """Recursively substitute environment variable placeholders in config."""
@@ -160,7 +156,9 @@ class VoiceAssistant:
             # Handle environment variable substitution
             if config.startswith("${") and config.endswith("}"):
                 env_var = config[2:-1]  # Remove ${ and }
-                return os.getenv(env_var, config)  # Return original if env var not found
+                return os.getenv(
+                    env_var, config
+                )  # Return original if env var not found
             return config
         else:
             return config
@@ -278,17 +276,15 @@ class VoiceAssistant:
         """Convert audio bytes to text via Whisper."""
         try:
             wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, 'wb') as wf:
+            with wave.open(wav_buffer, "wb") as wf:
                 wf.setnchannels(self.channels)
                 wf.setsampwidth(self.audio.get_sample_size(self.audio_format))
                 wf.setframerate(self.rate)
                 wf.writeframes(audio_data)
             wav_buffer.seek(0)
-            wav_buffer.name = 'audio.wav'
+            wav_buffer.name = "audio.wav"
             resp = self.openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=wav_buffer,
-                language="en"
+                model="whisper-1", file=wav_buffer, language="en"
             )
             return resp.text.strip()
         except Exception as e:
@@ -300,9 +296,7 @@ class VoiceAssistant:
         try:
             # Call OpenAI TTS endpoint synchronously
             resp = self.openai_client.audio.speech.create(
-                model="tts-1",
-                voice="shimmer",
-                input=text
+                model="tts-1", voice="shimmer", input=text
             )
             # Extract raw MP3 bytes
             audio_bytes = resp.content
@@ -323,7 +317,7 @@ class VoiceAssistant:
             TTS_ENGINE.say(text)
             TTS_ENGINE.runAndWait()
             return True
-        
+
     async def process_command(self, text: str) -> str:
         """Handle built-in commands or forward to MCP agent."""
         logger.info(f"User said: {text}")
@@ -343,7 +337,7 @@ class VoiceAssistant:
         # stub for stopping mid-speech (needs wiring in text_to_speech)
         if normalized == "stop":
             self._stop_speaking.set()
-            return ""                      # no spoken response
+            return ""  # no spoken response
 
         if not self.agent:
             return "Assistant not initialized."
@@ -404,24 +398,50 @@ class VoiceAssistant:
             # Cleanup
             self.audio.terminate()
             pygame.mixer.quit()
-            if hasattr(self, 'mcp_client') and self.mcp_client:
+            if hasattr(self, "mcp_client") and self.mcp_client:
                 await self.mcp_client.close_all_sessions()
+
 
 async def main():
     """CLI entrypoint: parse args and launch assistant."""
     import argparse
+
     from dotenv import load_dotenv
+
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="Voice-enabled AI assistant")
-    parser.add_argument("--openai-api-key", default=os.getenv("OPENAI_API_KEY"), help="OpenAI API key")
-    parser.add_argument("--elevenlabs-api-key", default=os.getenv("ELEVENLABS_API_KEY"), help="ElevenLabs API key")
-    parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-4"), help="OpenAI model to use")
-    parser.add_argument("--voice-id", default=os.getenv("ELEVENLABS_VOICE_ID", "ZF6FPAbjXT4488VcRRnw"), help="ElevenLabs voice ID")
-    parser.add_argument("--vad-aggressiveness", type=int, default=2, help="webrtcvad aggressiveness (0-3)")
-    parser.add_argument("--silence-threshold", type=int, default=int(os.getenv("VOICE_SILENCE_THRESHOLD", "500")), help="Amplitude threshold for silence")
-    parser.add_argument("--silence-duration", type=float, default=float(os.getenv("VOICE_SILENCE_DURATION", "1.5")), help="Silence duration in seconds")
-    parser.add_argument("--system-prompt", default=os.getenv("ASSISTANT_SYSTEM_PROMPT"), help="Custom system prompt")
+    parser.add_argument(
+        "--openai-api-key", default=os.getenv("OPENAI_API_KEY"), help="OpenAI API key"
+    )
+    parser.add_argument(
+        "--model",
+        default=os.getenv("OPENAI_MODEL", "gpt-4.1"),
+        help="OpenAI model to use",
+    )
+    parser.add_argument(
+        "--vad-aggressiveness",
+        type=int,
+        default=int(os.getenv("VAD_AGGRESSIVENESS", "3")),
+        help="webrtcvad aggressiveness (0-3)",
+    )
+    parser.add_argument(
+        "--silence-threshold",
+        type=int,
+        default=int(os.getenv("VOICE_SILENCE_THRESHOLD", "500")),
+        help="Amplitude threshold for silence",
+    )
+    parser.add_argument(
+        "--silence-duration",
+        type=float,
+        default=float(os.getenv("VOICE_SILENCE_DURATION", "0.5")),
+        help="Silence duration in seconds",
+    )
+    parser.add_argument(
+        "--system-prompt",
+        default=os.getenv("ASSISTANT_SYSTEM_PROMPT"),
+        help="Custom system prompt",
+    )
 
     args = parser.parse_args()
 
@@ -433,12 +453,10 @@ async def main():
     # Load MCP servers config
     with open(credential_path("mcp_servers.json"), "r") as f:
         mcp_config = json.load(f)
-    
+
     assistant = VoiceAssistant(
         openai_api_key=args.openai_api_key,
-        elevenlabs_api_key=args.elevenlabs_api_key,
         model=args.model,
-        elevenlabs_voice_id=args.voice_id,
         vad_aggressiveness=args.vad_aggressiveness,
         silence_threshold=args.silence_threshold,
         silence_duration=args.silence_duration,
