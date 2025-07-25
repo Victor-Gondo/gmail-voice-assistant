@@ -146,6 +146,14 @@ conda activate gmail-voice-env
 python agent.py
 ```
 
+To interact with the assistant:
+
+1. The assistant continuously listens for commands
+2. Start each command with the wake word "assistant" similiar to how you would call other smart home devices. (e.g., "assistant read my latest email" or "assistant send an email to John")
+3. The assistant will process your command and respond using text-to-speech
+
+The assistant will continue listening for the wake word after completing each command. To stop the assistant, you can say call the assistant and say "exit", "quit", or "goodbye". You can also press Ctrl+C in the terminal to force quit the program. (e.g., "assistant that's all goodbye")
+
 ### Deactivating the Virtual Environment
 
 When you're done working on the project:
