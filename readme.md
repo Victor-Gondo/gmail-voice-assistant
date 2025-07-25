@@ -113,7 +113,7 @@ mv gcp-oauth.keys.json ~/.gmail-mcp/
 
 3. Install and authenticate:
 ```bash
-npx -y @smithery/cli install @gongrzhe/server-gmail-autoauth-mcp
+npx -y @smithery/cli install @gongrzhe/server-gmail-autoauth-mcp --client claude
 npx @gongrzhe/server-gmail-autoauth-mcp auth
 ```
 
@@ -122,7 +122,7 @@ npx @gongrzhe/server-gmail-autoauth-mcp auth
 1. Place `gcp-oauth.keys.json` in your project directory or in `./.gmail-mcp/`
 2. Run the authentication commands:
 ```bash
-npx -y @smithery/cli install @gongrzhe/server-gmail-autoauth-mcp
+npx -y @smithery/cli install @gongrzhe/server-gmail-autoauth-mcp --client claude
 npx @gongrzhe/server-gmail-autoauth-mcp auth
 ```
 

@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "gmail": {
-      "command": "npx.cmd",
+      "command": "npx",
       "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"]
     }
   }
